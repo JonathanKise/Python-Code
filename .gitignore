@@ -41,6 +41,7 @@ pip-delete-this-directory.txt
 
 # --- Environment / Secrets ---
 *.env
+.env
 .env.*
 *.ini
 config.json
@@ -58,3 +59,5 @@ desktop.ini
 .cache/
 .mypy_cache/
 .pytest_cache/
+
+cookies.txt

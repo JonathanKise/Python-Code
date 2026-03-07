@@ -206,7 +206,9 @@ def download_mp3(url: str, output_folder: str = MUSIC_DOWNLOAD_FOLDER) -> str:
         "quiet": True,
         "noplaylist": True,
         "ignorewarnings": True,
+        "cookies": "cookies.txt",  # <-- ADD THIS LINE
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
@@ -246,7 +248,9 @@ def get_playlist_urls(url: str) -> list[str]:
         "extract_flat": True,
         "skip_download": True,
         "ignorewarnings": True,
+        "cookies": "cookies.txt",  # <-- ADD THIS
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(extraction_url, download=False)
