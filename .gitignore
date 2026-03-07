@@ -1,0 +1,60 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dll
+*.dylib
+
+# --- Virtual Environments ---
+venv/
+env/
+botenv/
+.venv/
+ENV/
+env.bak/
+
+# --- PyInstaller / Nuitka / Build Artifacts ---
+build/
+*.spec
+*.build
+*.dist
+*.onefile-build
+*.nuitka-build
+*.nuitka-cache
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Tools ---
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+
+# --- Environment / Secrets ---
+*.env
+.env.*
+*.ini
+config.json
+token.txt
+
+# --- Logs ---
+*.log
+
+# --- OS / Editor Junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Cache ---
+.cache/
+.mypy_cache/
+.pytest_cache/
