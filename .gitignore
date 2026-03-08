@@ -38,7 +38,7 @@ pip-delete-this-directory.txt
 
 # PyCharm
 .idea/
-
+dist/*
 # --- Environment / Secrets ---
 *.env
 .env
@@ -46,7 +46,7 @@ pip-delete-this-directory.txt
 *.ini
 config.json
 token.txt
-
+Queue/*
 # --- Logs ---
 *.log
 

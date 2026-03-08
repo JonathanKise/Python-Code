@@ -27,6 +27,7 @@ DELETE_AFTER_PLAY = os.getenv("DELETE_AFTER_PLAY", "false").lower() == "true"
 ARCHIVE_FOLDER = os.getenv("ARCHIVE_FOLDER", "./Archive")
 MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
 MUSIC_DOWNLOAD_FOLDER = os.getenv("MUSIC_DOWNLOAD_FOLDER", "./Queue")
+DOWNLOAD_DELAY = float(os.getenv("DOWNLOAD_DELAY", "1.0"))  # seconds between downloads
 os.makedirs(MUSIC_DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
 
@@ -41,6 +42,7 @@ class MusicBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.queues: dict[int, deque[str]] = {}
+        self.download_tasks: dict[int, asyncio.Task] = {}  # track background download tasks per guild
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -49,7 +51,7 @@ class MusicBot(commands.Bot):
 bot = MusicBot()
 
 # ====================
-# BUTTON CONTROLS (Previous button removed)
+# BUTTON CONTROLS
 # ====================
 class MusicControls(discord.ui.View):
     def __init__(self):
@@ -101,17 +103,19 @@ class MusicControls(discord.ui.View):
     async def stop(self, interaction: discord.Interaction, _):
         voice = interaction.guild.voice_client
         if voice:
+            # Cancel any background download task
+            task = bot.download_tasks.pop(interaction.guild.id, None)
+            if task and not task.done():
+                task.cancel()
             voice.stop()
             await voice.disconnect()
             q = get_guild_queue(interaction.guild.id)
             q.clear()
-            # Clear queue folder
             for file in os.listdir(MUSIC_DOWNLOAD_FOLDER):
                 try:
                     os.remove(os.path.join(MUSIC_DOWNLOAD_FOLDER, file))
                 except:
                     pass
-            # Delete now playing message on stop
             if hasattr(voice, 'now_playing_msg'):
                 try:
                     await voice.now_playing_msg.delete()
@@ -144,7 +148,7 @@ async def update_progress_bar(voice: discord.VoiceClient):
         if not voice.is_connected():
             break
         position = (time.time() - voice.start_time - voice.paused_time) * 1000
-        if position > voice.duration + 2000:  # small buffer
+        if position > voice.duration + 2000:
             break
         progress = create_progress_bar(position, voice.duration)
         time_display = f"{format_time(position)} {progress} {format_time(voice.duration)}"
@@ -157,13 +161,11 @@ async def update_progress_bar(voice: discord.VoiceClient):
         try:
             await voice.now_playing_msg.edit(embed=embed, view=MusicControls())
         except discord.NotFound:
-            # Message was deleted → stop updating
             break
         except discord.HTTPException as e:
-            if e.code == 50027:  # Invalid Webhook Token / message too old
+            if e.code == 50027:
                 break
             print(f"Edit failed: {e}")
-    # Clean up when track ends / stopped
     if hasattr(voice, 'now_playing_msg'):
         try:
             await voice.now_playing_msg.delete()
@@ -172,7 +174,7 @@ async def update_progress_bar(voice: discord.VoiceClient):
         del voice.now_playing_msg
 
 # ====================
-# LINK PARSER (unchanged)
+# LINK PARSER
 # ====================
 def get_search_query(query: str) -> str:
     if "music.apple.com" in query or "itunes.apple.com" in query or "spotify.com" in query:
@@ -191,10 +193,24 @@ def get_search_query(query: str) -> str:
 # ====================
 # YT-DLP HELPERS
 # ====================
+YDL_OPTS_BASE = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "noplaylist": True,
+    "ignorewarnings": True,
+    "cookies": "cookies.txt",
+    # Retry and connection resilience
+    "retries": 5,
+    "fragment_retries": 5,
+    "retry_sleep_functions": {"http": lambda n: 2 ** n},  # exponential backoff: 1s, 2s, 4s...
+    "socket_timeout": 30,
+    "http_chunk_size": 1048576,  # 1MB chunks — reduces connection resets on large files
+}
+
 def download_mp3(url: str, output_folder: str = MUSIC_DOWNLOAD_FOLDER) -> str:
     os.makedirs(output_folder, exist_ok=True)
     ydl_opts = {
-        "format": "bestaudio/best",
+        **YDL_OPTS_BASE,
         "outtmpl": f"{output_folder}/%(title)s.%(ext)s",
         "postprocessors": [
             {
@@ -203,19 +219,15 @@ def download_mp3(url: str, output_folder: str = MUSIC_DOWNLOAD_FOLDER) -> str:
                 "preferredquality": "192",
             }
         ],
-        "quiet": True,
-        "noplaylist": True,
-        "ignorewarnings": True,
-        "cookies": "cookies.txt",  # <-- ADD THIS LINE
     }
-
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        if filename.endswith(".webm"):
-            filename = filename.replace(".webm", ".mp3")
-        elif filename.endswith(".m4a"):
-            filename = filename.replace(".m4a", ".mp3")
+        # Normalize extension after postprocessing
+        for ext in (".webm", ".m4a", ".opus", ".ogg"):
+            if filename.endswith(ext):
+                filename = filename[: -len(ext)] + ".mp3"
+                break
         return filename
 
 async def async_download_mp3(url: str, output_folder: str = MUSIC_DOWNLOAD_FOLDER) -> str | None:
@@ -224,13 +236,12 @@ async def async_download_mp3(url: str, output_folder: str = MUSIC_DOWNLOAD_FOLDE
         try:
             return await loop.run_in_executor(pool, download_mp3, url, output_folder)
         except yt_dlp.utils.DownloadError as e:
-            if "Video unavailable" in str(e):
-                print(f"Skipping unavailable video: {url}")
-            else:
-                print("Download error:", e)
+            print(f"Download error ({url}): {e}")
             return None
+        except asyncio.CancelledError:
+            raise  # let cancellation propagate cleanly
         except Exception as e:
-            print("Unexpected download error:", e)
+            print(f"Unexpected download error ({url}): {e}")
             return None
 
 def get_playlist_urls(url: str) -> list[str]:
@@ -248,7 +259,8 @@ def get_playlist_urls(url: str) -> list[str]:
         "extract_flat": True,
         "skip_download": True,
         "ignorewarnings": True,
-        "cookies": "cookies.txt",  # <-- ADD THIS
+        "cookies": "cookies.txt",
+        "socket_timeout": 30,
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -267,7 +279,6 @@ def get_playlist_urls(url: str) -> list[str]:
                     urls.append(f"https://www.youtube.com/watch?v={video_id}")
             return urls
 
-        # Single video or search result fallback
         return [url]
 
 # ====================
@@ -278,11 +289,8 @@ def get_guild_queue(guild_id: int) -> deque[str]:
         bot.queues[guild_id] = deque()
     return bot.queues[guild_id]
 
-def enqueue_tracks(guild_id: int, paths: list[str]) -> int:
-    q = get_guild_queue(guild_id)
-    for p in paths:
-        q.append(p)
-    return len(paths)
+def enqueue_track(guild_id: int, path: str):
+    get_guild_queue(guild_id).append(path)
 
 async def play_next_in_queue(guild: discord.Guild):
     voice = guild.voice_client
@@ -293,7 +301,6 @@ async def play_next_in_queue(guild: discord.Guild):
         return
     next_path = q.popleft()
     print(f"▶ Playing: {next_path}")
-    # Reset / set attributes
     voice.current_path = next_path
     try:
         voice.duration = MP3(next_path).info.length * 1000
@@ -302,7 +309,7 @@ async def play_next_in_queue(guild: discord.Guild):
     voice.start_time = time.time()
     voice.paused_time = 0.0
     voice.pause_start = None
-    # Create / update now playing message
+
     progress = create_progress_bar(0, voice.duration)
     time_display = f"{format_time(0)} {progress} {format_time(voice.duration)}"
     title = os.path.basename(next_path).replace('.mp3', '')
@@ -314,17 +321,15 @@ async def play_next_in_queue(guild: discord.Guild):
     text_channel = getattr(voice, 'text_channel', guild.text_channels[0] if guild.text_channels else None)
     if text_channel:
         try:
-            # If we already have a message, edit it
             if hasattr(voice, 'now_playing_msg') and voice.now_playing_msg:
                 await voice.now_playing_msg.edit(embed=embed, view=MusicControls())
             else:
-                # First time → send new
                 msg = await text_channel.send(embed=embed, view=MusicControls())
                 voice.now_playing_msg = msg
-            # Start background progress updater
             bot.loop.create_task(update_progress_bar(voice))
         except Exception as e:
             print(f"Now playing send/edit error: {e}")
+
     def after_play(err=None):
         if err:
             print("FFmpeg error:", err)
@@ -336,19 +341,74 @@ async def play_next_in_queue(guild: discord.Guild):
         except:
             pass
         asyncio.run_coroutine_threadsafe(play_next_in_queue(guild), bot.loop)
+
     source = discord.FFmpegPCMAudio(next_path, executable="ffmpeg")
     voice.play(source, after=after_play)
 
 # ====================
-# SLASH COMMANDS (only showing changed /play for brevity)
+# BACKGROUND SEQUENTIAL DOWNLOADER
+# Downloads one track at a time with a delay between each,
+# enqueues each as soon as it's ready, and kicks off playback
+# as soon as the first track lands.
+# ====================
+async def sequential_download_and_enqueue(
+    guild: discord.Guild,
+    urls: list[str],
+    status_channel: discord.TextChannel,
+):
+    voice = guild.voice_client
+    first_track = True
+    failed = 0
+
+    for i, url in enumerate(urls):
+        # Respect cancellation (e.g. user called /stop)
+        if asyncio.current_task().cancelled():
+            break
+
+        path = await async_download_mp3(url)
+
+        if path is None:
+            failed += 1
+            continue
+
+        enqueue_track(guild.id, path)
+        print(f"✅ Queued ({i+1}/{len(urls)}): {os.path.basename(path)}")
+
+        # Start playback as soon as first track is ready
+        if first_track:
+            first_track = False
+            voice = guild.voice_client  # re-fetch in case of reconnect
+            if voice and not voice.is_playing():
+                await play_next_in_queue(guild)
+
+        # Delay between downloads to avoid connection resets
+        if i < len(urls) - 1:
+            await asyncio.sleep(DOWNLOAD_DELAY)
+
+    # Summary message only for playlists
+    if len(urls) > 1:
+        success = len(urls) - failed
+        try:
+            await status_channel.send(
+                f"✅ Finished downloading **{success}/{len(urls)}** tracks."
+                + (f" ({failed} skipped)" if failed else ""),
+                delete_after=15,
+            )
+        except:
+            pass
+
+# ====================
+# SLASH COMMANDS
 # ====================
 @bot.tree.command(name="play", description="Play a YouTube video or playlist URL")
-@app_commands.describe(query="YouTube video or playlist URL")
+@app_commands.describe(query="YouTube video or playlist URL, or a search term")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
+
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.followup.send("❌ You must be in a voice channel.", ephemeral=True)
         return
+
     voice = interaction.guild.voice_client
     if not voice:
         try:
@@ -356,36 +416,51 @@ async def play(interaction: discord.Interaction, query: str):
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to connect: `{e}`", ephemeral=True)
             return
+
     voice.text_channel = interaction.channel
+
     parsed_query = get_search_query(query)
     if parsed_query is None:
-        await interaction.followup.send("❌ Playlists not supported from Spotify/Apple. Use YouTube or song name.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ Playlists not supported from Spotify/Apple. Use YouTube or a song name.",
+            ephemeral=True,
+        )
         return
+
     try:
         urls = get_playlist_urls(parsed_query)
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to parse: `{e}`", ephemeral=True)
         return
+
     if not urls:
         await interaction.followup.send("❌ No valid tracks found.", ephemeral=True)
         return
-    is_search = not query.startswith(('http', 'https'))
+
+    # Single search query → only grab the top result
+    is_search = not query.startswith(("http", "https"))
     if is_search:
         urls = urls[:1]
+
     if len(urls) > MAX_PLAYLIST_SIZE:
         urls = urls[:MAX_PLAYLIST_SIZE]
-    await interaction.followup.send(f"📥 Downloading {len(urls)} track(s)...")
-    tasks = [async_download_mp3(u) for u in urls]
-    paths = await asyncio.gather(*tasks)
-    downloaded_paths = [p for p in paths if p is not None]
-    if not downloaded_paths:
-        await interaction.followup.send("❌ Failed to download any tracks.", ephemeral=True)
-        return
-    added = enqueue_tracks(interaction.guild.id, downloaded_paths)
-    msg = f"✅ Added **{added}** track{'s' if added > 1 else ''} to the queue."
-    await interaction.followup.send(msg)
-    if not voice.is_playing():
-        await play_next_in_queue(interaction.guild)
+
+    track_word = "track" if len(urls) == 1 else "tracks"
+    await interaction.followup.send(
+        f"📥 Queuing **{len(urls)}** {track_word} — playback starts as soon as the first one downloads!"
+    )
+
+    # Cancel any existing download task for this guild (e.g. user queued again)
+    old_task = bot.download_tasks.pop(interaction.guild.id, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    # Kick off background downloader
+    task = bot.loop.create_task(
+        sequential_download_and_enqueue(interaction.guild, urls, interaction.channel)
+    )
+    bot.download_tasks[interaction.guild.id] = task
+
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
@@ -399,35 +474,48 @@ async def skip(interaction: discord.Interaction):
     voice.stop()
     await interaction.response.send_message("⏭ Skipped.", ephemeral=True)
 
+
 @bot.tree.command(name="stop", description="Stop playback and clear the queue")
 async def stop(interaction: discord.Interaction):
+    # Cancel background downloads
+    task = bot.download_tasks.pop(interaction.guild.id, None)
+    if task and not task.done():
+        task.cancel()
+
     voice: discord.VoiceClient | None = interaction.guild.voice_client
     if voice and voice.is_connected():
         voice.stop()
         await voice.disconnect()
+
     q = get_guild_queue(interaction.guild.id)
     q.clear()
-    # Clear queue folder
+
     for file in os.listdir(MUSIC_DOWNLOAD_FOLDER):
         try:
             os.remove(os.path.join(MUSIC_DOWNLOAD_FOLDER, file))
         except Exception as e:
             print(f"Error deleting file {file}: {e}")
+
     await interaction.response.send_message("⏹ Stopped and cleared the queue.", ephemeral=True)
+
 
 @bot.tree.command(name="queue", description="Show the current queue")
 async def queue_cmd(interaction: discord.Interaction):
     q = get_guild_queue(interaction.guild.id)
-    if not q:
+    downloading = interaction.guild.id in bot.download_tasks and not bot.download_tasks[interaction.guild.id].done()
+    if not q and not downloading:
         await interaction.response.send_message("🎵 Queue is empty.", ephemeral=True)
         return
     lines = []
     for i, path in enumerate(list(q)[:10], start=1):
-        name = os.path.basename(path)
+        name = os.path.basename(path).replace('.mp3', '')
         lines.append(f"{i}. {name}")
     if len(q) > 10:
         lines.append(f"... and {len(q) - 10} more")
+    if downloading:
+        lines.append("*(more tracks still downloading...)*")
     await interaction.response.send_message("🎵 **Current queue:**\n" + "\n".join(lines), ephemeral=True)
+
 
 @bot.tree.command(name="pause", description="Pause the current song")
 async def pause(interaction: discord.Interaction):
@@ -441,6 +529,7 @@ async def pause(interaction: discord.Interaction):
     voice.pause()
     await interaction.response.send_message("⏸ Paused.", ephemeral=True)
 
+
 @bot.tree.command(name="resume", description="Resume the current song")
 async def resume(interaction: discord.Interaction):
     voice: discord.VoiceClient | None = interaction.guild.voice_client
@@ -452,6 +541,7 @@ async def resume(interaction: discord.Interaction):
         return
     voice.resume()
     await interaction.response.send_message("▶ Resumed.", ephemeral=True)
+
 
 # ====================
 # RUN BOT
